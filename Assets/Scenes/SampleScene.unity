@@ -1437,9 +1437,9 @@ MonoBehaviour:
   m_Name: 
   m_EditorClassIdentifier: 
   receiver: {fileID: 1513125991}
-  instancedMaterial: {fileID: 2100000, guid: ca9c5c268b41b78409284f8acfc307da, type: 2}
-  pointCloudCompute: {fileID: 7200000, guid: da82cd9508f5d7f488005bbc4b8c6b45, type: 3}
-  CubeSize: 0.01
+  instancedMaterial: {fileID: 2100000, guid: 589381ba99eb3ef469b6a45f73132098, type: 2}
+  pointCloudCompute: {fileID: 7200000, guid: 26b68ac3128dde3459556bca7838b570, type: 3}
+  pointSizeWorld: 0.4
   scale: 100
   cullMin: 0.01
   cullMax: 10
@@ -1447,8 +1447,7 @@ MonoBehaviour:
   yCull: 2
   moveSpeedPerSecond: 0.2
   rotationSpeedDegreesPerSecond: 25
-  scalingRatePerSecond: 1.5
-  cubeSizePerSecond: 0.01
+  pointSizeAdjustPerSecond: 0.01
   logPerformance: 1
 --- !u!1660057539 &9223372036854775807
 SceneRoots:
