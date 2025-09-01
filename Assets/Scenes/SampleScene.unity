@@ -959,7 +959,7 @@ GameObject:
   - component: {fileID: 943538750}
   - component: {fileID: 943538749}
   - component: {fileID: 943538748}
-  - component: {fileID: 943538747}
+  - component: {fileID: 943538751}
   m_Layer: 0
   m_Name: Visual Effect
   m_TagString: Untagged
@@ -967,23 +967,6 @@ GameObject:
   m_NavMeshLayer: 0
   m_StaticEditorFlags: 0
   m_IsActive: 1
---- !u!114 &943538747
-MonoBehaviour:
-  m_ObjectHideFlags: 0
-  m_CorrespondingSourceObject: {fileID: 0}
-  m_PrefabInstance: {fileID: 0}
-  m_PrefabAsset: {fileID: 0}
-  m_GameObject: {fileID: 943538746}
-  m_Enabled: 1
-  m_EditorHideFlags: 0
-  m_Script: {fileID: 11500000, guid: b459ee529e59f6d49b69bc149660f57b, type: 3}
-  m_Name: 
-  m_EditorClassIdentifier: 
-  source: {fileID: 1513125991}
-  depthIsUInt16MM: 1
-  flipY: 1
-  stride: 1
-  particleSize: 0.003
 --- !u!73398921 &943538748
 VFXRenderer:
   serializedVersion: 1
@@ -1035,7 +1018,7 @@ VisualEffect:
   m_PrefabAsset: {fileID: 0}
   m_GameObject: {fileID: 943538746}
   m_Enabled: 1
-  m_Asset: {fileID: 8926484042661614526, guid: 9fc5518364dced047b535b83e6e239f1, type: 3}
+  m_Asset: {fileID: 8926484042661614526, guid: 8f1f091f7b6669f41afa9de77f5a2d36, type: 3}
   m_InitialEventName: OnPlay
   m_InitialEventNameOverriden: 0
   m_StartSeed: 0
@@ -1080,6 +1063,32 @@ Transform:
   m_Children: []
   m_Father: {fileID: 0}
   m_LocalEulerAnglesHint: {x: 0, y: 0, z: 0}
+--- !u!114 &943538751
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 943538746}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 74e3174fbb1ca684db544711ea454c52, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: 
+  receiver: {fileID: 1513125991}
+  pointCloudCompute: {fileID: 7200000, guid: d470c4bc374ab8743be4e0d4f54096ff, type: 3}
+  scale: 100
+  vfx: {fileID: 943538749}
+  vfxCapacity: 500000
+  pointSizeWorld: 1.08
+  cullMin: 0.01
+  cullMax: 10
+  xCull: 2
+  yCull: 2
+  moveSpeedPerSecond: 0.2
+  rotationSpeedDegreesPerSecond: 25
+  pointSizeAdjustPerSecond: 0.01
+  logPerformance: 1
 --- !u!1 &1142433867
 GameObject:
   m_ObjectHideFlags: 0
@@ -1569,10 +1578,11 @@ MonoBehaviour:
   m_Name: 
   m_EditorClassIdentifier: 
   receiver: {fileID: 1513125991}
-  instancedMaterial: {fileID: 2100000, guid: 589381ba99eb3ef469b6a45f73132098, type: 2}
   pointCloudCompute: {fileID: 7200000, guid: 26b68ac3128dde3459556bca7838b570, type: 3}
-  pointSizeWorld: 0.4
   scale: 100
+  vfx: {fileID: 0}
+  vfxCapacity: 500000
+  pointSizeWorld: 0.4
   cullMin: 0.01
   cullMax: 10
   xCull: 2

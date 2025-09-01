@@ -1,73 +1,85 @@
+// CubeRendering.compute — Unity 6000.0.33f1
+// Produces packed float3 Positions (and optional float4 Colors) for a VFX Graph.
+// Dispatch groups: ( (_Width+7)/8, (_Height+7)/8, 1 )
+
 #pragma kernel CSMain
+#pragma target 5.0
 
-RWStructuredBuffer<float4x4> matrixBuffer;
-RWStructuredBuffer<uint> depthBuffer;
+// ---------- Inputs ----------
+StructuredBuffer<uint> depthBuffer;     // ushort uploaded as uint from C#
 
-int _Width;
-int _Height;
-float _Fx;
-float _Fy;
-float _Cx;
-float _Cy;
-float _CubeSize;
-float _Scale;
+// ---------- Outputs ----------
+RWStructuredBuffer<float3> Positions;   // capacity >= _Width * _Height
+RWStructuredBuffer<float4> Colors;      // optional, still bound from C#
 
-float _CullMinZ;
-float _CullMaxZ;
+// GPU counters (1 element each)
+RWStructuredBuffer<uint> _ValidCount;   // depth > 0
+RWStructuredBuffer<uint> _VisibleCount; // after all culls
 
-float _CullX;
-float _CullY;
+// Optional RGB texture (bound when available; we use Load(), so no sampler needed)
+Texture2D<float4> _ColorTex;
 
-float4x4 _PoseMatrix;
+// ---------- Uniforms ----------
+uint  _Width, _Height;
+float _Fx, _Fy, _Cx, _Cy;
+float _Scale;               // visual/world scale applied AFTER meter culling
+float _CullMinZ, _CullMaxZ; // METERS
+float _CullX, _CullY;       // optional ROI extents (user-defined semantics)
+float4x4 _PoseMatrix;       // sensor->world
+float4x4 _VP;               // camera VP for optional frustum test
+int _UseColorTex;           // 1 if _ColorTex is bound
+int _DoFrustum;             // 1 = perform frustum test; 0 = skip (debug)
 
+// 8x8 threads per group
 [numthreads(8, 8, 1)]
-void CSMain(uint3 id : SV_DispatchThreadID)
+void CSMain (uint3 id : SV_DispatchThreadID)
 {
-    uint x = id.x;
-    uint y = id.y;
+    if (id.x >= _Width || id.y >= _Height) return;
 
-    if (x >= _Width || y >= _Height)
+    const uint u = id.x;
+    const uint v = id.y;
+    const uint idx = v * _Width + u;
+
+    // 1) Depth in mm -> meters (no scale yet)
+    uint zRaw = depthBuffer[idx];
+    if (zRaw == 0) return;
+
+    InterlockedAdd(_ValidCount[0], 1);
+
+    float z_m = zRaw * 0.001f;                  // meters
+    if (z_m < _CullMinZ || z_m > _CullMaxZ)     // cull in meters to avoid unit mixups
         return;
 
-    uint flippedY = _Height - 1 - y;
-    uint index = flippedY * _Width + x;
+    // 2) Apply visual/world scale AFTER culling
+    float zs = z_m * _Scale;
+    float x  = ((float)u - _Cx) / _Fx * zs;
+    float y  = ((float)v - _Cy) / _Fy * zs;
 
-    uint depthRaw = depthBuffer[index];
-    float z = (float) depthRaw * 0.001f; // ggf. skalieren
+    float4 world = mul(_PoseMatrix, float4(x, y, zs, 1.0f));
 
-    float X = (x - _Cx) * z / _Fx;
-    float Y = (y - _Cy) * z / _Fy;
+    // (Optional) ROI culling in world space (example only, customize to your needs):
+    // if (abs(world.x) > _CullX || abs(world.y) > _CullY) return;
 
-    float4x4 mat;
-
-    //Culling, see bounds for rendering
-    if (z < _CullMinZ || z > _CullMaxZ || abs(X) > _CullX || abs(Y) > _CullY)
+    // 3) Optional frustum test
+    if (_DoFrustum != 0)
     {
-        mat = float4x4(
-            float4(0, 0, 0, 99999),
-            float4(0, 0, 0, 99999),
-            float4(0, 0, 0, 99999),
-            float4(0, 0, 0, 1)
-        );
+        float4 clip = mul(_VP, world);
+        if (clip.w <= 0) return;
+        if (abs(clip.x) > clip.w || abs(clip.y) > clip.w || clip.z < -clip.w || clip.z > clip.w)
+            return;
     }
-    else
+
+    // 4) Compact write
+    uint writeIndex;
+    InterlockedAdd(_VisibleCount[0], 1, writeIndex);
+    Positions[writeIndex] = world.xyz;
+
+    // 5) Optional color
+    float4 c = float4(1,1,1,1);
+    if (_UseColorTex != 0)
     {
-        mat = float4x4(
-            float4(_CubeSize, 0, 0, X),
-            float4(0, _CubeSize, 0, Y),
-            float4(0, 0, _CubeSize, z),
-            float4(0, 0, 0, 1)
-        );
+        // integer texel coords, mip=0
+        c = _ColorTex.Load(int3(u, v, 0));
     }
-    
-    //Scaling, for better visualisation
-    mat[0] *= _Scale;
-    mat[1] *= _Scale;
-    mat[2] *= _Scale;
-    mat[3] *= _Scale;
-
-    // Apply Translation and Rotation
-    mat = mul(_PoseMatrix, mat);
-
-    matrixBuffer[y * _Width + x] = mat;
+    Colors[writeIndex] = c;
 }

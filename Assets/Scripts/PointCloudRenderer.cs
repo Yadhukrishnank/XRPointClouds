@@ -2,20 +2,31 @@ using System;
 using System.Runtime.InteropServices;
 using UnityEngine;
 using UnityEngine.XR;
+using UnityEngine.VFX;
+
 
 public class PointCloudRenderer : MonoBehaviour
 {
     [Header("Data Source")]
     public ZmqFrameReceiver receiver;
 
-    [Header("Rendering")]
-    public Material instancedMaterial;        // uses PointCloud/BillboardURP
+    [Header("Compute")]
     public ComputeShader pointCloudCompute;   // CubeRendering.compute
+    [Tooltip("Visual/world scale. Keep 1.0 while debugging; raise later if you really want.")]
+    public float scale = 1.0f;
+
+    [Header("VFX")]
+    public VisualEffect vfx;                  // Assign the VisualEffect component
+    [Tooltip("Must be <= VFX Graph Capacity. We'll clamp Count to this.")]
+    public int vfxCapacity = 500_000;
+
+    [Header("Point Controls")]
     public float pointSizeWorld = 0.01f;
-    public float scale = 100.0f;
 
     [Header("Culling (updated by incoming packets)")]
+    [Tooltip("Meters")]
     public float cullMin = 0.01f;
+    [Tooltip("Meters")]
     public float cullMax = 10.0f;
     public float xCull = 2.0f;
     public float yCull = 2.0f;
@@ -28,15 +39,18 @@ public class PointCloudRenderer : MonoBehaviour
     [Header("Diagnostics")]
     public bool logPerformance = true;
 
-    // --- buffers & state ---
+    // ---------- GPU resources ----------
     private Texture2D rgbTexture;
-    private ComputeBuffer depthBuffer;      // uint per pixel (depth)
-    private uint[] depth;
-    private ComputeBuffer matrixBuffer;     // per-instance TRS matrices
-    private ComputeBuffer argsBuffer;       // indirect draw args
+    private ComputeBuffer depthBuffer;          // uint per pixel (depth)
+    private uint[] depthCPU;
 
-    private ComputeBuffer validCountBuffer;     // GPU counter for valid
-    private ComputeBuffer visibleCountBuffer;   // GPU counter for visible
+    // Use GraphicsBuffer so we can bind to both ComputeShader and VFX
+    private GraphicsBuffer positionsBuffer;     // float3 per point
+    private GraphicsBuffer colorsBuffer;        // float4 per point (optional)
+    private int bufferCapacity = 0;             // width*height allocated
+
+    private ComputeBuffer validCountBuffer;     // 1 uint
+    private ComputeBuffer visibleCountBuffer;   // 1 uint
     private readonly uint[] validCountCPU   = new uint[1];
     private readonly uint[] visibleCountCPU = new uint[1];
 
@@ -44,17 +58,16 @@ public class PointCloudRenderer : MonoBehaviour
     private int visiblePoints = 0;
     private float lastCountSample = 0f;
 
-    private Mesh instanceMesh;              // a Quad
-    private Bounds renderBounds;
-
+    // Stream state
     private int width = 1, height = 1;
     private float fx = 591.4252f, fy = 591.4252f, cx = 320.1326f, cy = 239.1477f;
 
+    // Pose
     private Vector3 renderingLocation = Vector3.zero;
     private Quaternion renderingRotation = Quaternion.identity;
     private Matrix4x4 poseMatrix = Matrix4x4.identity;
 
-    // FPS counters
+    // FPS diagnostics
     private int renderFrameCounter = 0;
     private int streamFrameCounter = 0;
     private float fpsWindowStart = 0f;
@@ -69,66 +82,82 @@ public class PointCloudRenderer : MonoBehaviour
     public float ValidDensity01   => (width * height > 0) ? (float)validPoints / (width * height)   : 0f;
     public float VisibleDensity01 => (width * height > 0) ? (float)visiblePoints / (width * height) : 0f;
 
+    // Kernel cache
+    private int csKernel = -1;
+
+    // VFX property IDs
+    static readonly int ID_PointSizeWorld = Shader.PropertyToID("PointSizeWorld");
+    static readonly int ID_Count          = Shader.PropertyToID("Count");
+    static readonly int ID_Positions      = Shader.PropertyToID("Positions");
+    static readonly int ID_Colors         = Shader.PropertyToID("Colors");
+
+    // ---- Lifecycle ----
     void Start()
     {
-        // use a Quad mesh (2 tris) for billboarded points
-        var temp = GameObject.CreatePrimitive(PrimitiveType.Quad);
-        instanceMesh = temp.GetComponent<MeshFilter>().sharedMesh;
-        Destroy(temp);
-
-        renderBounds = new Bounds(Vector3.zero, Vector3.one * 1000);
-
         fpsWindowStart = Time.unscaledTime;
+        csKernel = pointCloudCompute != null ? pointCloudCompute.FindKernel("CSMain") : -1;
         InitBuffers();
+        PushStaticParamsToVFX();
     }
 
     private void InitBuffers()
     {
-        matrixBuffer?.Release();
-        argsBuffer?.Release();
+        // Release old
+        positionsBuffer?.Dispose();
+        colorsBuffer?.Dispose();
         depthBuffer?.Release();
         validCountBuffer?.Release();
         visibleCountBuffer?.Release();
 
-        rgbTexture = new Texture2D(Mathf.Max(1, width), Mathf.Max(1, height), TextureFormat.RGB24, false);
+        // Texture
+        if (rgbTexture == null || rgbTexture.width != width || rgbTexture.height != height)
+            rgbTexture = new Texture2D(Mathf.Max(1, width), Mathf.Max(1, height), TextureFormat.RGB24, false);
 
-        depthBuffer = new ComputeBuffer(width * height, sizeof(uint));
-        depth = new uint[width * height];
+        // Capacity
+        int capacity = Mathf.Max(1, width * height);
 
-        matrixBuffer = new ComputeBuffer(width * height, Marshal.SizeOf(typeof(Matrix4x4)));
-        instancedMaterial.SetBuffer("matrixBuffer", matrixBuffer);
+        // Depth
+        depthBuffer = new ComputeBuffer(capacity, sizeof(uint));
+        depthCPU = new uint[capacity];
 
-        instancedMaterial.SetTexture("_ColorTex", rgbTexture);
-        instancedMaterial.SetInt("_Width", width);
-        instancedMaterial.SetInt("_Height", height);
+        // Positions / Colors (Structured)
+        positionsBuffer = new GraphicsBuffer(GraphicsBuffer.Target.Structured, capacity, sizeof(float) * 3);
+        colorsBuffer    = new GraphicsBuffer(GraphicsBuffer.Target.Structured, capacity, sizeof(float) * 4);
+        bufferCapacity = capacity;
 
+        // Counters
         validCountBuffer   = new ComputeBuffer(1, sizeof(uint));
         visibleCountBuffer = new ComputeBuffer(1, sizeof(uint));
 
-        argsBuffer = new ComputeBuffer(1, 5 * sizeof(uint), ComputeBufferType.IndirectArguments);
-        uint[] args = new uint[5] {
-            (instanceMesh != null) ? instanceMesh.GetIndexCount(0) : 0, // index count
-            (uint)(width * height),                                     // instance count
-            (instanceMesh != null) ? instanceMesh.GetIndexStart(0) : 0,
-            (instanceMesh != null) ? instanceMesh.GetBaseVertex(0) : 0,
-            0
-        };
-        argsBuffer.SetData(args);
+        // Static compute bindings
+        if (pointCloudCompute != null && csKernel >= 0)
+        {
+            pointCloudCompute.SetBuffer(csKernel, "depthBuffer",    depthBuffer);
+            pointCloudCompute.SetBuffer(csKernel, "Positions",      positionsBuffer);
+            pointCloudCompute.SetBuffer(csKernel, "Colors",         colorsBuffer);
+            pointCloudCompute.SetBuffer(csKernel, "_ValidCount",    validCountBuffer);
+            pointCloudCompute.SetBuffer(csKernel, "_VisibleCount",  visibleCountBuffer);
+        }
 
-        Debug.Log($"[Renderer] Init buffers with size {width}x{height}");
+        // Prime VFX with buffers
+        if (vfx != null)
+        {
+            // These will warn if properties don't exist. Make sure your VFX graph has them.
+            vfx.SetGraphicsBuffer(ID_Positions, positionsBuffer);
+            vfx.SetGraphicsBuffer(ID_Colors,    colorsBuffer);
+            vfx.Reinit(); // refresh after property changes / new buffers
+        }
+
+        Debug.Log($"[Renderer] Init buffers with size {width}x{height} (capacity {capacity})");
     }
 
     void Update()
     {
         HandleControllers();
 
-        // update batch bounds center to avoid whole-batch culling
-        renderBounds.center = renderingLocation;
-
-        // counts Unity render loop FPS
         renderFrameCounter++;
 
-        // Pull latest frame from receiver (if any)
+        // Pull latest frame
         if (receiver != null && receiver.TryGetLatest(out var pkt) && pkt.IsValid)
         {
             bool sizeChanged = (pkt.width != width) || (pkt.height != height);
@@ -138,36 +167,31 @@ public class PointCloudRenderer : MonoBehaviour
             fx = pkt.fx; fy = pkt.fy; cx = pkt.cx; cy = pkt.cy;
             cullMin = pkt.cullMin; cullMax = pkt.cullMax; xCull = pkt.xCull; yCull = pkt.yCull;
 
-            if (sizeChanged || rgbTexture == null || rgbTexture.width != width || rgbTexture.height != height)
+            if (sizeChanged || bufferCapacity < width * height)
                 InitBuffers();
 
-            // RGB (compressed)
+            // RGB (compressed → Texture2D)
             rgbTexture.LoadImage(pkt.rgbBytes);
 
             // Depth (ushort -> uint buffer)
             SetDepthBuffer(pkt.depthBytes);
 
-            // Compute + fill matrixBuffer (positions)
+            // Compute
             DispatchComputeShader();
 
-            // Count only frames actually applied
             streamFrameCounter++;
         }
 
-        // Update per-frame material params (camera vectors & point size)
-        var cam = Camera.main;
-        if (cam != null)
+        // Feed VFX params (clamp to capacity)
+        if (vfx != null)
         {
-            instancedMaterial.SetVector("_CamRight", cam.transform.right);
-            instancedMaterial.SetVector("_CamUp",    cam.transform.up);
-        }
-        instancedMaterial.SetFloat("_PointSizeWorld", pointSizeWorld);
+            int countForVFX = Mathf.Clamp(visiblePoints, 0, Mathf.Min(vfxCapacity, bufferCapacity));
+            vfx.SetInt(ID_Count, countForVFX);
+            vfx.SetFloat(ID_PointSizeWorld, pointSizeWorld);
 
-        // Draw instanced billboards
-        if (argsBuffer != null && instancedMaterial != null)
-        {
-            Graphics.DrawMeshInstancedIndirect(
-                instanceMesh, 0, instancedMaterial, renderBounds, argsBuffer);
+            // Optional rebinds if you want to be extra safe each frame:
+            // vfx.SetGraphicsBuffer(ID_Positions, positionsBuffer);
+            // vfx.SetGraphicsBuffer(ID_Colors,    colorsBuffer);
         }
 
         if (logPerformance) LogFps();
@@ -176,32 +200,26 @@ public class PointCloudRenderer : MonoBehaviour
     private void SetDepthBuffer(byte[] latestDepthBytes)
     {
         int count = latestDepthBytes.Length / 2;
-        if (depth == null || depth.Length < count) depth = new uint[count];
+        if (depthCPU == null || depthCPU.Length < count) depthCPU = new uint[count];
 
         var depthUshorts = new ushort[count];
         Buffer.BlockCopy(latestDepthBytes, 0, depthUshorts, 0, latestDepthBytes.Length);
-        for (int i = 0; i < count; i++) depth[i] = depthUshorts[i];
+        for (int i = 0; i < count; i++) depthCPU[i] = depthUshorts[i];
 
-        depthBuffer.SetData(depth);
+        depthBuffer.SetData(depthCPU, 0, 0, count);
     }
 
     private void DispatchComputeShader()
     {
-        int kernel = pointCloudCompute.FindKernel("CSMain");
+        if (pointCloudCompute == null || csKernel < 0) return;
 
-        // zero counters before dispatch
+        // Zero counters
         validCountCPU[0] = 0;
         visibleCountCPU[0] = 0;
         validCountBuffer.SetData(validCountCPU);
         visibleCountBuffer.SetData(visibleCountCPU);
 
-        // bind buffers
-        pointCloudCompute.SetBuffer(kernel, "depthBuffer", depthBuffer);
-        pointCloudCompute.SetBuffer(kernel, "matrixBuffer", matrixBuffer);
-        pointCloudCompute.SetBuffer(kernel, "_ValidCount", validCountBuffer);
-        pointCloudCompute.SetBuffer(kernel, "_VisibleCount", visibleCountBuffer);
-
-        // uniforms
+        // Uniforms
         pointCloudCompute.SetInt("_Width", width);
         pointCloudCompute.SetInt("_Height", height);
         pointCloudCompute.SetFloat("_Fx", fx);
@@ -209,16 +227,16 @@ public class PointCloudRenderer : MonoBehaviour
         pointCloudCompute.SetFloat("_Cx", cx);
         pointCloudCompute.SetFloat("_Cy", cy);
         pointCloudCompute.SetFloat("_Scale", scale);
-        pointCloudCompute.SetFloat("_CubeSize", 1.0f); // unused by billboard shader
-        pointCloudCompute.SetFloat("_CullMinZ", cullMin);
-        pointCloudCompute.SetFloat("_CullMaxZ", cullMax);
+        pointCloudCompute.SetFloat("_CullMinZ", cullMin); // meters
+        pointCloudCompute.SetFloat("_CullMaxZ", cullMax); // meters
         pointCloudCompute.SetFloat("_CullX", xCull);
         pointCloudCompute.SetFloat("_CullY", yCull);
 
+        // Pose
         poseMatrix = Matrix4x4.TRS(renderingLocation, renderingRotation, Vector3.one);
         pointCloudCompute.SetMatrix("_PoseMatrix", poseMatrix);
 
-        // camera VP for frustum test
+        // Camera VP
         var cam = Camera.main;
         if (cam != null)
         {
@@ -226,11 +244,25 @@ public class PointCloudRenderer : MonoBehaviour
             pointCloudCompute.SetMatrix("_VP", VP);
         }
 
-        int tgx = Mathf.CeilToInt(width / 8.0f);
-        int tgy = Mathf.CeilToInt(height / 8.0f);
-        pointCloudCompute.Dispatch(kernel, tgx, tgy, 1);
+        // Color
+        if (rgbTexture != null)
+        {
+            pointCloudCompute.SetTexture(csKernel, "_ColorTex", rgbTexture);
+            pointCloudCompute.SetInt("_UseColorTex", 1);
+        }
+        else
+        {
+            pointCloudCompute.SetInt("_UseColorTex", 0);
+        }
 
-        // read back ~2x/sec to avoid stalls
+        // Frustum toggle: start disabled while debugging visibility
+        pointCloudCompute.SetInt("_DoFrustum", 0);
+
+        int tgx = Mathf.Max(1, (width  + 7) / 8);
+        int tgy = Mathf.Max(1, (height + 7) / 8);
+        pointCloudCompute.Dispatch(csKernel, tgx, tgy, 1);
+
+        // Read back ~2x/sec
         if (Time.unscaledTime - lastCountSample > 0.5f)
         {
             validCountBuffer.GetData(validCountCPU);     // 4 bytes
@@ -281,6 +313,20 @@ public class PointCloudRenderer : MonoBehaviour
             pointSizeWorld += sizeDelta;
     }
 
+    private void PushStaticParamsToVFX()
+    {
+        if (vfx == null) return;
+
+        // Initial push (names must exist in the VFX Graph)
+        vfx.SetFloat(ID_PointSizeWorld, pointSizeWorld);
+        vfx.SetInt(ID_Count, 0);
+        if (positionsBuffer != null) vfx.SetGraphicsBuffer(ID_Positions, positionsBuffer);
+        if (colorsBuffer != null)    vfx.SetGraphicsBuffer(ID_Colors,    colorsBuffer);
+
+        // Helpful when graph changed or properties were added
+        vfx.Reinit();
+    }
+
     private void LogFps()
     {
         float now = Time.unscaledTime;
@@ -301,13 +347,14 @@ public class PointCloudRenderer : MonoBehaviour
 
     void OnDestroy()
     {
-        matrixBuffer?.Release();
-        argsBuffer?.Release();
+        positionsBuffer?.Dispose();
+        colorsBuffer?.Dispose();
         depthBuffer?.Release();
         validCountBuffer?.Release();
         visibleCountBuffer?.Release();
     }
 
+    // Re-init on focus changes (common on Quest resume)
     void OnApplicationFocus(bool hasFocus)
     {
         if (hasFocus) InitBuffers();
