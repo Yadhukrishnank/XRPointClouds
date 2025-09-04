@@ -53,7 +53,7 @@ void CSMain (uint3 id : SV_DispatchThreadID)
     // 2) Apply visual/world scale AFTER culling
     float zs = z_m * _Scale;
     float x  = ((float)u - _Cx) / _Fx * zs;
-    float y  = ((float)v - _Cy) / _Fy * zs;
+    float y  = -((float)v - _Cy) / _Fy * zs;
 
     float4 world = mul(_PoseMatrix, float4(x, y, zs, 1.0f));
 
