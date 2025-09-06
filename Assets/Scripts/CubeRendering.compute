@@ -1,5 +1,5 @@
-// CubeRendering.compute — Unity 6000.0.33f1
-// Produces packed float3 Positions (and optional float4 Colors) for a VFX Graph.
+// Assets/Shaders/CubeRendering.compute
+// Unity 6000.0.33f1 — Produces packed float3 Positions (+ optional float4 Colors) for VFX Graph.
 // Dispatch groups: ( (_Width+7)/8, (_Height+7)/8, 1 )
 
 #pragma kernel CSMain
@@ -16,7 +16,7 @@ RWStructuredBuffer<float4> Colors;      // optional, still bound from C#
 RWStructuredBuffer<uint> _ValidCount;   // depth > 0
 RWStructuredBuffer<uint> _VisibleCount; // after all culls
 
-// Optional RGB texture (bound when available; we use Load(), so no sampler needed)
+// Optional RGB texture (read only)
 Texture2D<float4> _ColorTex;
 
 // ---------- Uniforms ----------
@@ -24,11 +24,15 @@ uint  _Width, _Height;
 float _Fx, _Fy, _Cx, _Cy;
 float _Scale;               // visual/world scale applied AFTER meter culling
 float _CullMinZ, _CullMaxZ; // METERS
-float _CullX, _CullY;       // optional ROI extents (user-defined semantics)
+float _CullX, _CullY;       // optional ROI extents (unused here)
 float4x4 _PoseMatrix;       // sensor->world
 float4x4 _VP;               // camera VP for optional frustum test
 int _UseColorTex;           // 1 if _ColorTex is bound
-int _DoFrustum;             // 1 = perform frustum test; 0 = skip (debug)
+int _DoFrustum;             // 1 = perform frustum test; 0 = skip
+
+// Orientation controls
+int _FlipPosX, _FlipPosY;   // flips for geometry (normalized camera coords)
+int _FlipRgbX, _FlipRgbY;   // flips for RGB sampling (texture coords)
 
 // 8x8 threads per group
 [numthreads(8, 8, 1)]
@@ -52,12 +56,20 @@ void CSMain (uint3 id : SV_DispatchThreadID)
 
     // 2) Apply visual/world scale AFTER culling
     float zs = z_m * _Scale;
-    float x  = ((float)u - _Cx) / _Fx * zs;
-    float y  = -((float)v - _Cy) / _Fy * zs;
+
+    // Normalized camera coords
+    float xn = ((float)u - _Cx) / _Fx;
+    float yn = ((float)v - _Cy) / _Fy;
+
+    if (_FlipPosX != 0) xn = -xn;
+    if (_FlipPosY != 0) yn = -yn;
+
+    float x = xn * zs;
+    float y = yn * zs;
 
     float4 world = mul(_PoseMatrix, float4(x, y, zs, 1.0f));
 
-    // (Optional) ROI culling in world space (example only, customize to your needs):
+    // (Optional) ROI culling in world space (example only)
     // if (abs(world.x) > _CullX || abs(world.y) > _CullY) return;
 
     // 3) Optional frustum test
@@ -78,8 +90,9 @@ void CSMain (uint3 id : SV_DispatchThreadID)
     float4 c = float4(1,1,1,1);
     if (_UseColorTex != 0)
     {
-        // integer texel coords, mip=0
-        c = _ColorTex.Load(int3(u, v, 0));
+        uint su = (_FlipRgbX != 0) ? (_Width  - 1 - u) : u;
+        uint sv = (_FlipRgbY != 0) ? (_Height - 1 - v) : v;
+        c = _ColorTex.Load(int3(su, sv, 0)); // integer texel coords, mip=0
     }
     Colors[writeIndex] = c;
 }

@@ -1,9 +1,10 @@
+// Assets/Scripts/PointCloudRenderer.cs
+// Unity 6000.0.33f1 — streams RGB-D → Compute → GraphicsBuffers → VFX Graph
+
 using System;
-using System.Runtime.InteropServices;
 using UnityEngine;
 using UnityEngine.XR;
 using UnityEngine.VFX;
-
 
 public class PointCloudRenderer : MonoBehaviour
 {
@@ -12,24 +13,32 @@ public class PointCloudRenderer : MonoBehaviour
 
     [Header("Compute")]
     public ComputeShader pointCloudCompute;   // CubeRendering.compute
-    [Tooltip("Visual/world scale. Keep 1.0 while debugging; raise later if you really want.")]
+    [Tooltip("Visual/world scale. Keep 1.0 while debugging; raise later if needed.")]
     public float scale = 1.0f;
 
     [Header("VFX")]
-    public VisualEffect vfx;                  // Assign the VisualEffect component
+    public VisualEffect vfx;                  // VisualEffect component with Graph params:
+                                              // GraphicsBuffer Positions, Colors; Int Count; Float PointSizeWorld
     [Tooltip("Must be <= VFX Graph Capacity. We'll clamp Count to this.")]
     public int vfxCapacity = 500_000;
 
     [Header("Point Controls")]
     public float pointSizeWorld = 0.01f;
 
-    [Header("Culling (updated by incoming packets)")]
-    [Tooltip("Meters")]
+    [Header("Culling (meters)")]
     public float cullMin = 0.01f;
-    [Tooltip("Meters")]
     public float cullMax = 10.0f;
     public float xCull = 2.0f;
     public float yCull = 2.0f;
+
+    [Header("Image ↔ Unity flips (set by device/backend)")]
+    public bool flipPosX = false;
+    public bool flipPosY = true;   // image Y-down → Unity Y-up is commonly true
+    public bool flipRgbX = false;
+    public bool flipRgbY = true;   // start true to match the geometry Y flip
+
+    [Header("Frustum")]
+    public bool doFrustumTest = false;
 
     [Header("Controller Controls")]
     public float moveSpeedPerSecond = 0.2f;
@@ -40,8 +49,8 @@ public class PointCloudRenderer : MonoBehaviour
     public bool logPerformance = true;
 
     // ---------- GPU resources ----------
-    private Texture2D rgbTexture;
-    private ComputeBuffer depthBuffer;          // uint per pixel (depth)
+    private Texture2D rgbTexture;               // read by compute (Load)
+    private ComputeBuffer depthBuffer;          // uint per pixel (depth in ushort uploaded as uint)
     private uint[] depthCPU;
 
     // Use GraphicsBuffer so we can bind to both ComputeShader and VFX
@@ -109,7 +118,7 @@ public class PointCloudRenderer : MonoBehaviour
         validCountBuffer?.Release();
         visibleCountBuffer?.Release();
 
-        // Texture
+        // Ensure a texture exists (we overwrite with LoadImage later)
         if (rgbTexture == null || rgbTexture.width != width || rgbTexture.height != height)
             rgbTexture = new Texture2D(Mathf.Max(1, width), Mathf.Max(1, height), TextureFormat.RGB24, false);
 
@@ -142,10 +151,9 @@ public class PointCloudRenderer : MonoBehaviour
         // Prime VFX with buffers
         if (vfx != null)
         {
-            // These will warn if properties don't exist. Make sure your VFX graph has them.
             vfx.SetGraphicsBuffer(ID_Positions, positionsBuffer);
             vfx.SetGraphicsBuffer(ID_Colors,    colorsBuffer);
-            vfx.Reinit(); // refresh after property changes / new buffers
+            // no Reinit here to avoid restarting the effect each resize unless you prefer
         }
 
         Debug.Log($"[Renderer] Init buffers with size {width}x{height} (capacity {capacity})");
@@ -168,7 +176,11 @@ public class PointCloudRenderer : MonoBehaviour
             cullMin = pkt.cullMin; cullMax = pkt.cullMax; xCull = pkt.xCull; yCull = pkt.yCull;
 
             if (sizeChanged || bufferCapacity < width * height)
+            {
                 InitBuffers();
+                // if you want to hard refresh the VFX when buffers change:
+                if (vfx != null) vfx.Reinit();
+            }
 
             // RGB (compressed → Texture2D)
             rgbTexture.LoadImage(pkt.rgbBytes);
@@ -188,8 +200,7 @@ public class PointCloudRenderer : MonoBehaviour
             int countForVFX = Mathf.Clamp(visiblePoints, 0, Mathf.Min(vfxCapacity, bufferCapacity));
             vfx.SetInt(ID_Count, countForVFX);
             vfx.SetFloat(ID_PointSizeWorld, pointSizeWorld);
-
-            // Optional rebinds if you want to be extra safe each frame:
+            // Rebinding each frame is optional:
             // vfx.SetGraphicsBuffer(ID_Positions, positionsBuffer);
             // vfx.SetGraphicsBuffer(ID_Colors,    colorsBuffer);
         }
@@ -255,8 +266,14 @@ public class PointCloudRenderer : MonoBehaviour
             pointCloudCompute.SetInt("_UseColorTex", 0);
         }
 
-        // Frustum toggle: start disabled while debugging visibility
-        pointCloudCompute.SetInt("_DoFrustum", 0);
+        // Flips
+        pointCloudCompute.SetInt("_FlipPosX", flipPosX ? 1 : 0);
+        pointCloudCompute.SetInt("_FlipPosY", flipPosY ? 1 : 0);
+        pointCloudCompute.SetInt("_FlipRgbX", flipRgbX ? 1 : 0);
+        pointCloudCompute.SetInt("_FlipRgbY", flipRgbY ? 1 : 0);
+
+        // Frustum toggle
+        pointCloudCompute.SetInt("_DoFrustum", doFrustumTest ? 1 : 0);
 
         int tgx = Mathf.Max(1, (width  + 7) / 8);
         int tgy = Mathf.Max(1, (height + 7) / 8);
@@ -316,14 +333,10 @@ public class PointCloudRenderer : MonoBehaviour
     private void PushStaticParamsToVFX()
     {
         if (vfx == null) return;
-
-        // Initial push (names must exist in the VFX Graph)
         vfx.SetFloat(ID_PointSizeWorld, pointSizeWorld);
         vfx.SetInt(ID_Count, 0);
         if (positionsBuffer != null) vfx.SetGraphicsBuffer(ID_Positions, positionsBuffer);
         if (colorsBuffer != null)    vfx.SetGraphicsBuffer(ID_Colors,    colorsBuffer);
-
-        // Helpful when graph changed or properties were added
         vfx.Reinit();
     }
 
