@@ -10,16 +10,16 @@ StructuredBuffer<uint> depthBuffer;     // ushort uploaded as uint from C#
 
 // ---------- Outputs ----------
 RWStructuredBuffer<float3> Positions;   // capacity >= _Width * _Height
-RWStructuredBuffer<float4> Colors;      // optional, still bound from C#
+RWStructuredBuffer<float4> Colors;   
 
-// GPU counters (1 element each)
-RWStructuredBuffer<uint> _ValidCount;   // depth > 0
+
+RWStructuredBuffer<uint> _ValidCount; 
 RWStructuredBuffer<uint> _VisibleCount; // after all culls
 
-// Optional RGB texture (read only)
+
 Texture2D<float4> _ColorTex;
 
-// ---------- Uniforms ----------
+
 uint  _Width, _Height;
 float _Fx, _Fy, _Cx, _Cy;
 float _Scale;               // visual/world scale applied AFTER meter culling
@@ -69,10 +69,6 @@ void CSMain (uint3 id : SV_DispatchThreadID)
 
     float4 world = mul(_PoseMatrix, float4(x, y, zs, 1.0f));
 
-    // (Optional) ROI culling in world space (example only)
-    // if (abs(world.x) > _CullX || abs(world.y) > _CullY) return;
-
-    // 3) Optional frustum test
     if (_DoFrustum != 0)
     {
         float4 clip = mul(_VP, world);
@@ -86,7 +82,7 @@ void CSMain (uint3 id : SV_DispatchThreadID)
     InterlockedAdd(_VisibleCount[0], 1, writeIndex);
     Positions[writeIndex] = world.xyz;
 
-    // 5) Optional color
+
     float4 c = float4(1,1,1,1);
     if (_UseColorTex != 0)
     {
