@@ -449,7 +449,7 @@ GameObject:
   - component: {fileID: 1294954581272749721}
   - component: {fileID: 4207867937885310171}
   - component: {fileID: 3897813631474846381}
-  - component: {fileID: 3195526043727423982}
+  - component: {fileID: 8983147406182259732}
   m_Layer: 0
   m_Name: 'Cube '
   m_TagString: Untagged
@@ -547,7 +547,7 @@ BoxCollider:
   serializedVersion: 3
   m_Size: {x: 1, y: 1, z: 1}
   m_Center: {x: 0, y: 0, z: 0}
---- !u!114 &3195526043727423982
+--- !u!114 &8983147406182259732
 MonoBehaviour:
   m_ObjectHideFlags: 0
   m_CorrespondingSourceObject: {fileID: 0}
