@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Concurrent;
+using System.Linq;
 using System.Net;
 using System.Net.Sockets;
 using System.Text;
@@ -11,14 +12,22 @@ using NetMQ.Sockets;
 [Serializable]
 public struct FramePacket
 {
+    public int camId;                 // 0 = A, 1 = B, etc.
     public int width, height;
-    public byte[] rgbBytes;
-    public byte[] depthBytes;
+    public byte[] rgbBytes;           // JPEG/PNG bytes
+    public byte[] depthBytes;         // z16 (H*W*2, little-endian)
     public float fx, fy, cx, cy;
     public float cullMin, cullMax, xCull, yCull;
+    public Matrix4x4 pose;            // world_from_camera
+    public ulong timestampUs;
+
     public bool IsValid => rgbBytes != null && depthBytes != null && width > 0 && height > 0;
 }
 
+/// <summary>
+/// One-port receiver that de-multiplexes frames from multiple cameras
+/// and keeps the latest per camera in memory.
+/// </summary>
 public class ZmqFrameReceiver : MonoBehaviour
 {
     [Header("Discovery & Connection")]
@@ -27,25 +36,47 @@ public class ZmqFrameReceiver : MonoBehaviour
     public int discoveryPort = 5556;
     public int dataPort = 5555;
 
-    [Header("Diagnostics")]
-    public bool logConnection = false; // default to NO logs
+    [Header("Parsing Options")]
+    [Tooltip("If the sender wrote pose row-major, transpose here to match HLSL mul(_PoseMatrix, v).")]
+    public bool transposeIncomingPose = true;
+
+    [Header("Logging")]
+    public bool logDiscovery = true;
+    public bool logConnection = true;
+    public bool logFirstPacketPerCam = true;
 
     private Thread listenerThread;
     private volatile bool isRunning;
     private PullSocket subSocket;
-    private readonly ConcurrentQueue<FramePacket> queue = new ConcurrentQueue<FramePacket>();
+
+    // latest frame per cameraId
+    private readonly ConcurrentDictionary<int, FramePacket> _latest = new();
+    // optional FIFO
+    private readonly ConcurrentQueue<FramePacket> _queue = new();
+
+    // background→main-thread log pipe
+    private readonly ConcurrentQueue<string> _logQ = new();
+
+    // first packet marker
+    private readonly ConcurrentDictionary<int, bool> _seenCam = new();
+
+    // -------- Public API --------
+    public bool TryGetLatest(int camId, out FramePacket packet) => _latest.TryGetValue(camId, out packet);
+
+    public FramePacket[] GetAllLatest() => _latest.Values.ToArray();
 
     public bool TryGetLatest(out FramePacket packet)
     {
-        if (queue.TryDequeue(out packet))
+        if (_queue.TryDequeue(out packet))
         {
-            while (queue.TryDequeue(out var newer)) packet = newer;
+            while (_queue.TryDequeue(out var newer)) packet = newer;
             return true;
         }
         packet = default;
         return false;
     }
 
+    // -------- Unity lifecycle --------
     void Start()
     {
         isRunning = true;
@@ -53,26 +84,21 @@ public class ZmqFrameReceiver : MonoBehaviour
         listenerThread.Start();
     }
 
+    void Update()
+    {
+        while (_logQ.TryDequeue(out var l)) Debug.Log(l);
+    }
+
     void OnDestroy()
     {
         isRunning = false;
-
-        try
-        {
-            subSocket?.Close();
-            subSocket?.Dispose();
-        }
-        catch (Exception e)
-        {
-            if (logConnection) Debug.LogWarning("[ZMQ] Error closing socket: " + e);
-        }
-
-        if (listenerThread != null && listenerThread.IsAlive)
-            listenerThread.Join(500);
-
-        NetMQConfig.Cleanup();
+        try { subSocket?.Close(); subSocket?.Dispose(); } catch { }
+        try { if (listenerThread != null && listenerThread.IsAlive) listenerThread.Join(200); } catch { }
     }
 
+    private void BGLog(string msg) => _logQ.Enqueue($"[ZMQ {DateTime.Now:HH:mm:ss.fff}] {msg}");
+
+    // -------- Discovery --------
     private string FindServer(int timeoutMs = 1000)
     {
         string discoveredIp = null;
@@ -81,20 +107,21 @@ public class ZmqFrameReceiver : MonoBehaviour
             client.EnableBroadcast = true;
             client.Client.ReceiveTimeout = timeoutMs;
 
-            IPEndPoint broadcastEp = new IPEndPoint(IPAddress.Broadcast, discoveryPort);
+            var broadcastEp = new IPEndPoint(IPAddress.Broadcast, discoveryPort);
             byte[] request = Encoding.ASCII.GetBytes("DISCOVER_ZMQ_SERVER");
-            client.Send(request, request.Length, broadcastEp);
-
             try
             {
+                if (logDiscovery) BGLog($"DISCOVERY → *:{discoveryPort}");
+                client.Send(request, request.Length, broadcastEp);
+
                 IPEndPoint senderEp = new IPEndPoint(IPAddress.Any, 0);
-                byte[] response = client.Receive(ref senderEp);
+                byte[] response = client.Receive(ref senderEp); // throws on timeout
                 string msg = Encoding.ASCII.GetString(response);
 
                 if (msg.StartsWith("ZMQ_SERVER_HERE"))
                 {
                     discoveredIp = senderEp.Address.ToString();
-                    if (logConnection) Debug.Log("[ZMQ] Server found: " + discoveredIp);
+                    if (logDiscovery) BGLog($"DISCOVERY ✓ {discoveredIp}");
                 }
             }
             catch (SocketException) { /* timeout */ }
@@ -102,107 +129,128 @@ public class ZmqFrameReceiver : MonoBehaviour
         return discoveredIp;
     }
 
+    // -------- Listener --------
     private void ZmqListener()
     {
         AsyncIO.ForceDotNet.Force();
 
-        string serverIp = manualServerIp;
-
+        string serverIp = string.IsNullOrWhiteSpace(manualServerIp) ? null : manualServerIp;
         if (autoDiscoverServer)
         {
             bool found = false;
             while (!found && isRunning)
             {
                 serverIp = FindServer();
-                if (string.IsNullOrEmpty(serverIp))
-                {
-                    if (logConnection) Debug.LogWarning("[ZMQ] No server found, retrying…");
-                    Thread.Sleep(1000);
-                    continue;
-                }
+                if (string.IsNullOrEmpty(serverIp)) { Thread.Sleep(1000); continue; }
                 found = true;
             }
         }
+        if (string.IsNullOrEmpty(serverIp)) { _logQ.Enqueue("[ZMQ] ERROR: No server IP. Listener stops."); return; }
 
-        if (string.IsNullOrEmpty(serverIp))
+        using (subSocket = new PullSocket())
         {
-            if (logConnection) Debug.LogError("[ZMQ] Server IP is empty. Aborting listener.");
-            return;
-        }
+            subSocket.Options.ReceiveHighWatermark = 3;
+            subSocket.Connect($"tcp://{serverIp}:{dataPort}");
+            if (logConnection) BGLog($"CONNECT → tcp://{serverIp}:{dataPort}");
 
-        using (subSocket = new PullSocket($">tcp://{serverIp}:{dataPort}"))
-        {
-            if (logConnection) Debug.Log($"[ZMQ] Connected to tcp://{serverIp}:{dataPort}");
             while (isRunning)
             {
                 try
                 {
-                    // drain to latest frame to reduce latency
-                    byte[] lastMsg = null;
-                    while (subSocket.TryReceiveFrameBytes(TimeSpan.FromMilliseconds(5), out var msg))
-                        lastMsg = msg;
+                    if (!subSocket.TryReceiveFrameBytes(TimeSpan.FromMilliseconds(2), out var msg))
+                    { Thread.Sleep(1); continue; }
 
-                    if (lastMsg == null)
+                    if (TryParseMultiplexPacket(msg, out var packet))
                     {
-                        Thread.Sleep(1);
-                        continue;
+                        _latest[packet.camId] = packet;
+                        _queue.Enqueue(packet);
+
+                        if (logFirstPacketPerCam && !_seenCam.ContainsKey(packet.camId))
+                        {
+                            _seenCam[packet.camId] = true;
+                            BGLog($"PACKET(cam {packet.camId}) {packet.width}x{packet.height} | rgb={packet.rgbBytes?.Length ?? 0}B depth={packet.depthBytes?.Length ?? 0}B ts={packet.timestampUs}");
+                        }
                     }
-
-                    int offset = 0;
-
-                    // 1) size
-                    if (lastMsg.Length < offset + 8) continue;
-                    int w = BitConverter.ToInt32(lastMsg, offset); offset += 4;
-                    int h = BitConverter.ToInt32(lastMsg, offset); offset += 4;
-
-                    // 2) rgb length + bytes
-                    if (lastMsg.Length < offset + 4) continue;
-                    int rgbLen = BitConverter.ToInt32(lastMsg, offset); offset += 4;
-                    if (lastMsg.Length < offset + rgbLen) continue;
-                    var rgb = new byte[rgbLen];
-                    Buffer.BlockCopy(lastMsg, offset, rgb, 0, rgbLen);
-                    offset += rgbLen;
-
-                    // 3) depth length + bytes
-                    if (lastMsg.Length < offset + 4) continue;
-                    int depthLen = BitConverter.ToInt32(lastMsg, offset); offset += 4;
-                    if (lastMsg.Length < offset + depthLen) continue;
-                    var depth = new byte[depthLen];
-                    Buffer.BlockCopy(lastMsg, offset, depth, 0, depthLen);
-                    offset += depthLen;
-
-                    // 4) intrinsics
-                    if (lastMsg.Length < offset + 16) continue;
-                    float fx = BitConverter.ToSingle(lastMsg, offset); offset += 4;
-                    float fy = BitConverter.ToSingle(lastMsg, offset); offset += 4;
-                    float cx = BitConverter.ToSingle(lastMsg, offset); offset += 4;
-                    float cy = BitConverter.ToSingle(lastMsg, offset); offset += 4;
-
-                    // 5) culling
-                    if (lastMsg.Length < offset + 16) continue;
-                    float cullMin = BitConverter.ToSingle(lastMsg, offset); offset += 4;
-                    float cullMax = BitConverter.ToSingle(lastMsg, offset); offset += 4;
-                    float xCull   = BitConverter.ToSingle(lastMsg, offset); offset += 4;
-                    float yCull   = BitConverter.ToSingle(lastMsg, offset); offset += 4;
-
-                    var packet = new FramePacket
-                    {
-                        width = w,
-                        height = h,
-                        rgbBytes = rgb,
-                        depthBytes = depth,
-                        fx = fx, fy = fy, cx = cx, cy = cy,
-                        cullMin = cullMin, cullMax = cullMax, xCull = xCull, yCull = yCull
-                    };
-
-                    queue.Enqueue(packet);
                 }
                 catch (Exception ex)
                 {
-                    if (logConnection) Debug.LogError("[ZMQ] Listener fault: " + ex.Message);
-                    break;
+                    BGLog($"ERROR: listener loop: {ex.Message}");
+                    Thread.Sleep(50);
                 }
             }
         }
+    }
+
+    // -------- Parser (one-port multiplexed) --------
+    //
+    // Binary layout (little-endian):
+    // [camId:1][flags:1][reserved:2]
+    // [width:4][height:4]
+    // [fx:4][fy:4][cx:4][cy:4]
+    // [zMin:4][zMax:4][xCull:4][yCull:4]
+    // [pose:16*4 floats (row-major from sender)]
+    // [timestampUs:int64]
+    // [rgbLen:int32][rgbBytes]
+    // [depthLen:int32][depthBytes]
+    //
+    private bool TryParseMultiplexPacket(byte[] buf, out FramePacket packet)
+    {
+        packet = default;
+        if (buf == null || buf.Length < 8) return false;
+        int o = 0;
+        bool Need(int n) => (o + n) <= buf.Length;
+
+        if (!Need(4)) return false;
+        int camId = buf[o]; o += 1;
+        o += 1; // flags
+        o += 2; // reserved
+
+        if (!Need(8)) return false;
+        int w = BitConverter.ToInt32(buf, o); o += 4;
+        int h = BitConverter.ToInt32(buf, o); o += 4;
+
+        if (!Need(16)) return false;
+        float fx = BitConverter.ToSingle(buf, o); o += 4;
+        float fy = BitConverter.ToSingle(buf, o); o += 4;
+        float cx = BitConverter.ToSingle(buf, o); o += 4;
+        float cy = BitConverter.ToSingle(buf, o); o += 4;
+
+        if (!Need(16)) return false;
+        float zmin = BitConverter.ToSingle(buf, o); o += 4;
+        float zmax = BitConverter.ToSingle(buf, o); o += 4;
+        float xCull = BitConverter.ToSingle(buf, o); o += 4;
+        float yCull = BitConverter.ToSingle(buf, o); o += 4;
+
+        if (!Need(64)) return false;
+        Matrix4x4 pose = new Matrix4x4();
+        pose.m00 = BitConverter.ToSingle(buf, o); o += 4;  pose.m01 = BitConverter.ToSingle(buf, o); o += 4;  pose.m02 = BitConverter.ToSingle(buf, o); o += 4;  pose.m03 = BitConverter.ToSingle(buf, o); o += 4;
+        pose.m10 = BitConverter.ToSingle(buf, o); o += 4;  pose.m11 = BitConverter.ToSingle(buf, o); o += 4;  pose.m12 = BitConverter.ToSingle(buf, o); o += 4;  pose.m13 = BitConverter.ToSingle(buf, o); o += 4;
+        pose.m20 = BitConverter.ToSingle(buf, o); o += 4;  pose.m21 = BitConverter.ToSingle(buf, o); o += 4;  pose.m22 = BitConverter.ToSingle(buf, o); o += 4;  pose.m23 = BitConverter.ToSingle(buf, o); o += 4;
+        pose.m30 = BitConverter.ToSingle(buf, o); o += 4;  pose.m31 = BitConverter.ToSingle(buf, o); o += 4;  pose.m32 = BitConverter.ToSingle(buf, o); o += 4;  pose.m33 = BitConverter.ToSingle(buf, o); o += 4;
+        if (transposeIncomingPose) pose = pose.transpose;
+
+        if (!Need(8)) return false;
+        ulong ts = BitConverter.ToUInt64(buf, o); o += 8;
+
+        if (!Need(4)) return false;
+        int rgbLen = BitConverter.ToInt32(buf, o); o += 4;
+        if (!Need(rgbLen)) return false;
+        byte[] rgb = new byte[rgbLen]; Buffer.BlockCopy(buf, o, rgb, 0, rgbLen); o += rgbLen;
+
+        if (!Need(4)) return false;
+        int depthLen = BitConverter.ToInt32(buf, o); o += 4;
+        if (!Need(depthLen)) return false;
+        byte[] depth = new byte[depthLen]; Buffer.BlockCopy(buf, o, depth, 0, depthLen); o += depthLen;
+
+        packet = new FramePacket
+        {
+            camId = camId,
+            width = w, height = h,
+            rgbBytes = rgb, depthBytes = depth,
+            fx = fx, fy = fy, cx = cx, cy = cy,
+            cullMin = zmin, cullMax = zmax, xCull = xCull, yCull = yCull,
+            pose = pose, timestampUs = ts
+        };
+        return true;
     }
 }
