@@ -4,12 +4,6 @@ using System;
 using System.Linq;
 using System.Collections.Generic;
 
-/// <summary>
-/// Renders N cameras from a single multiplexed receiver by dispatching the same
-/// compute once per camera into the SAME output buffers (Positions/Colors).
-/// One VFX graph draws the merged cloud.
-/// Includes rich diagnostics to trace "no points visible" issues.
-/// </summary>
 public class MultiCamPointCloudRenderer : MonoBehaviour
 {
     [Header("References")]
@@ -22,10 +16,10 @@ public class MultiCamPointCloudRenderer : MonoBehaviour
     public int vfxCapacity = 750_000;
 
     [Header("Shader/VFX Property Names (must match VFX Graph)")]
-    public string positionsName   = "Positions";
-    public string colorsName      = "Colors";
+    public string positionsName   = "Positions";       // RWStructuredBuffer<float3>
+    public string colorsName      = "Colors";          // RWStructuredBuffer<float4>  (KEPT!)
     public string countName       = "Count";           // VFX exposed int
-    public string depthBufName    = "depthBuffer";
+    public string depthBufName    = "depthBuffer";     // StructuredBuffer<uint>
     public string poseName        = "_PoseMatrix";
     public string colorTexName    = "_ColorTex";
     public string useColorName    = "_UseColorTex";
@@ -37,18 +31,23 @@ public class MultiCamPointCloudRenderer : MonoBehaviour
     public bool flipRgbX = false, flipRgbY = true;
 
     [Header("Diagnostics")]
-    public bool verboseFrameLogs = true;
-    public bool logPerDispatch = true;
+    public bool verboseFrameLogs = false;
+    public bool logPerDispatch = false;
     public bool warnOnDepthMismatch = true;
-    public bool enableF1TestSlab = true;
+    public bool enableF1TestSlab = false;
+
+
+    [Header("Runtime Stats (read-only)")]
+    public int CurrentVisibleCount { get; private set; }  // for HUD
+    public int CurrentValidCount  { get; private set; }   // optional
 
     // IDs / kernel
     private int csKernel = -1;
     private int ID_Positions, ID_Colors, ID_Count;
 
     // GPU resources
-    private GraphicsBuffer positionsBuffer, colorsBuffer;
-    private ComputeBuffer depthBuffer, validCountBuffer, visibleCountBuffer;
+    private GraphicsBuffer positionsBuffer, colorsBuffer;         // float3 / float4
+    private ComputeBuffer depthBuffer, validCountBuffer, visibleCountBuffer; // uint
 
     // CPU scratch
     private readonly uint[] counter = new uint[1];
@@ -84,15 +83,22 @@ public class MultiCamPointCloudRenderer : MonoBehaviour
         Debug.Log($"[PCR] Init: VFX props: Count='{countName}', Pos='{positionsName}', Col='{colorsName}'");
     }
 
+    void OnDisable() => ReleaseAll();
     void OnDestroy() => ReleaseAll();
 
     void ReleaseAll()
     {
-        positionsBuffer?.Dispose(); positionsBuffer = null;
-        colorsBuffer?.Dispose();    colorsBuffer = null;
-        depthBuffer?.Dispose();     depthBuffer = null;
-        validCountBuffer?.Dispose(); validCountBuffer = null;
-        visibleCountBuffer?.Dispose(); visibleCountBuffer = null;
+        try { positionsBuffer?.Dispose(); } catch {}
+        try { colorsBuffer?.Dispose(); } catch {}
+        try { depthBuffer?.Dispose(); } catch {}
+        try { validCountBuffer?.Dispose(); } catch {}
+        try { visibleCountBuffer?.Dispose(); } catch {}
+
+        positionsBuffer = null;
+        colorsBuffer = null;
+        depthBuffer = null;
+        validCountBuffer = null;
+        visibleCountBuffer = null;
 
         foreach (var kv in _rgbByCam) if (kv.Value) Destroy(kv.Value);
         _rgbByCam.Clear();
@@ -106,32 +112,33 @@ public class MultiCamPointCloudRenderer : MonoBehaviour
 
         if (!need) return;
 
-        positionsBuffer?.Dispose();
-        colorsBuffer?.Dispose();
-        depthBuffer?.Dispose();
-        validCountBuffer?.Dispose();
-        visibleCountBuffer?.Dispose();
+        try { positionsBuffer?.Dispose(); } catch {}
+        try { colorsBuffer?.Dispose(); } catch {}
+        try { depthBuffer?.Dispose(); } catch {}
+        try { validCountBuffer?.Dispose(); } catch {}
+        try { visibleCountBuffer?.Dispose(); } catch {}
 
         bufferCapacity = Mathf.Max(pointsCapacity, 1);
         lastDepthElems = Mathf.Max(depthElems, 1);
 
+        // IMPORTANT: keep strides matching your compute shader (float3 / float4)
         positionsBuffer    = new GraphicsBuffer(GraphicsBuffer.Target.Structured, bufferCapacity, sizeof(float) * 3);
         colorsBuffer       = new GraphicsBuffer(GraphicsBuffer.Target.Structured, bufferCapacity, sizeof(float) * 4);
-        depthBuffer        = new ComputeBuffer(lastDepthElems, sizeof(uint));          // StructuredBuffer<uint>
-        validCountBuffer   = new ComputeBuffer(1, sizeof(uint));
-        visibleCountBuffer = new ComputeBuffer(1, sizeof(uint));
+        depthBuffer        = new ComputeBuffer(lastDepthElems, sizeof(uint), ComputeBufferType.Structured);
+        validCountBuffer   = new ComputeBuffer(1, sizeof(uint), ComputeBufferType.Structured);
+        visibleCountBuffer = new ComputeBuffer(1, sizeof(uint), ComputeBufferType.Structured);
 
-        // static binds
+        // static binds once
         pointCloudCompute.SetBuffer(csKernel, positionsName, positionsBuffer);
         pointCloudCompute.SetBuffer(csKernel, colorsName,    colorsBuffer);
         pointCloudCompute.SetBuffer(csKernel, depthBufName,  depthBuffer);
         pointCloudCompute.SetBuffer(csKernel, "_ValidCount",   validCountBuffer);
         pointCloudCompute.SetBuffer(csKernel, "_VisibleCount", visibleCountBuffer);
 
-        // VFX buffers
+        // VFX bindings
         vfx.SetGraphicsBuffer(ID_Positions, positionsBuffer);
         vfx.SetGraphicsBuffer(ID_Colors,    colorsBuffer);
-        vfx.Reinit(); // ensure VFX rebinds new buffers
+        vfx.Reinit(); // ensure the graph rebinds new buffers
 
         Debug.Log($"[PCR] EnsureBuffers: cap(points)={bufferCapacity}, cap(depthElems)={lastDepthElems}");
     }
@@ -147,41 +154,40 @@ public class MultiCamPointCloudRenderer : MonoBehaviour
     private static string PktInfo(in FramePacket f)
         => $"cam={f.camId} {f.width}x{f.height} | rgb={f.rgbBytes?.Length ?? 0}B depth={f.depthBytes?.Length ?? 0}B | fx={f.fx:0.0} fy={f.fy:0.0} cx={f.cx:0.0} cy={f.cy:0.0} | Z[{f.cullMin:0.00},{f.cullMax:0.00}]";
 
+    // Zero-alloc conversion of z16 bytes → uint[] (reuses per-cam buffer)
     void SetDepthBuffer(int camId, byte[] depthBytes, int w, int h)
     {
-        if (!_depthCpuByCam.TryGetValue(camId, out var depthCPU) || depthCPU == null || depthCPU.Length < w * h)
+        int n = w * h;
+        if (!_depthCpuByCam.TryGetValue(camId, out var depthCPU) || depthCPU == null || depthCPU.Length != n)
         {
-            depthCPU = new uint[w * h];
+            depthCPU = new uint[n];
             _depthCpuByCam[camId] = depthCPU;
         }
 
-        int expected = w * h;
-        int count = depthBytes.Length / 2;
-        if (count != expected && warnOnDepthMismatch)
-            Debug.LogWarning($"[PCR] Depth size mismatch (cam {camId}). got={count}, expected={expected}. Clamping & zero-padding.");
+        int have = (depthBytes != null ? depthBytes.Length / 2 : 0);
+        if (have != n && warnOnDepthMismatch)
+            Debug.LogWarning($"[PCR] Depth size mismatch (cam {camId}). got={have}, expected={n}. Clamping & zero-padding.");
 
-        count = Math.Min(count, expected);
+        int count = Math.Min(have, n);
 
-        var tmpU16 = new ushort[count];
-        Buffer.BlockCopy(depthBytes, 0, tmpU16, 0, count * 2);
-        for (int i = 0; i < count; i++) depthCPU[i] = tmpU16[i];
-        for (int i = count; i < expected; i++) depthCPU[i] = 0;
+        // little-endian z16 → uint
+        int j = 0;
+        for (int i = 0; i < count; i++, j += 2)
+            depthCPU[i] = (uint)(depthBytes[j] | (depthBytes[j + 1] << 8));
+        for (int i = count; i < n; i++) depthCPU[i] = 0u;
 
-        if (depthBuffer == null || depthBuffer.count < expected)
+        if (depthBuffer == null || depthBuffer.count != n)
         {
-            depthBuffer?.Dispose();
-            depthBuffer = new ComputeBuffer(expected, sizeof(uint));
+            try { depthBuffer?.Dispose(); } catch {}
+            depthBuffer = new ComputeBuffer(n, sizeof(uint), ComputeBufferType.Structured);
             pointCloudCompute.SetBuffer(csKernel, depthBufName, depthBuffer);
-            lastDepthElems = expected;
-            Debug.Log($"[PCR] Depth buffer resized → {expected} elems.");
+            lastDepthElems = n;
         }
+        depthBuffer.SetData(depthCPU);
 
-        depthBuffer.SetData(depthCPU, 0, 0, expected);
-
-        // tiny peek at first few depths to detect all-zero streams
-        if (verboseFrameLogs && expected >= 4)
+        if (verboseFrameLogs && n >= 64)
         {
-            int nz = 0; for (int i = 0; i < Math.Min(64, expected); i++) if (depthCPU[i] != 0) { nz++; if (nz > 2) break; }
+            int nz = 0; for (int i = 0; i < 64; i++) if (depthCPU[i] != 0) { nz++; if (nz > 2) break; }
             Debug.Log($"[PCR] cam={camId} depth peek: first64 nonzero={nz}");
         }
     }
@@ -191,18 +197,15 @@ public class MultiCamPointCloudRenderer : MonoBehaviour
         pointCloudCompute.SetInt("_DoFrustum", doFrustumTest ? 1 : 0);
 
         var cam = Camera.main;
-        if (cam == null)
-        {
-            if (Time.unscaledTime >= _nextCameraMainWarnAt)
-            {
-                Debug.LogWarning("[PCR] No Camera.main found. Frustum test OFF is recommended while debugging.");
-                _nextCameraMainWarnAt = Time.unscaledTime + 2f;
-            }
-        }
-        else
+        if (cam)
         {
             Matrix4x4 VP = cam.projectionMatrix * cam.worldToCameraMatrix;
             pointCloudCompute.SetMatrix("_VP", VP);
+        }
+        else if (doFrustumTest && Time.unscaledTime >= _nextCameraMainWarnAt)
+        {
+            Debug.LogWarning("[PCR] doFrustumTest is ON but no Camera.main — points will likely be culled.");
+            _nextCameraMainWarnAt = Time.unscaledTime + 2f;
         }
 
         pointCloudCompute.SetInt("_FlipPosX", flipPosX ? 1 : 0);
@@ -211,6 +214,7 @@ public class MultiCamPointCloudRenderer : MonoBehaviour
         pointCloudCompute.SetInt("_FlipRgbY", flipRgbY ? 1 : 0);
     }
 
+    // One dispatch per camera
     void DispatchForPacket(in FramePacket pkt, ref int visibleBefore, int passIndex)
     {
         // RGB texture per camera (persist by size)
@@ -219,11 +223,13 @@ public class MultiCamPointCloudRenderer : MonoBehaviour
             if (tex) Destroy(tex);
             tex = new Texture2D(Mathf.Max(1, pkt.width), Mathf.Max(1, pkt.height), TextureFormat.RGB24, false);
             _rgbByCam[pkt.camId] = tex;
+            tex.wrapMode = TextureWrapMode.Clamp;
+            tex.filterMode = FilterMode.Bilinear;
             if (verboseFrameLogs) Debug.Log($"[PCR] cam={pkt.camId} RGB texture (re)created: {pkt.width}x{pkt.height}");
         }
         if (useColor && pkt.rgbBytes != null && pkt.rgbBytes.Length > 0)
         {
-            bool ok = tex.LoadImage(pkt.rgbBytes);
+            bool ok = tex.LoadImage(pkt.rgbBytes, true); // non-readable to save memory
             pointCloudCompute.SetTexture(csKernel, colorTexName, tex);
             pointCloudCompute.SetInt(useColorName, ok ? 1 : 0);
             if (verboseFrameLogs && !ok) Debug.LogWarning($"[PCR] cam={pkt.camId} LoadImage failed; disabling color this dispatch.");
@@ -337,9 +343,8 @@ public class MultiCamPointCloudRenderer : MonoBehaviour
 
         // total capacity
         int totalPts = 0;
-        int maxDepthElems = 0;
-        foreach (var f in frames) { totalPts += Mathf.Max(0, f.width * f.height); maxDepthElems = Math.Max(maxDepthElems, f.width * f.height); }
-        EnsureBuffers(totalPts, maxDepthElems);
+        foreach (var f in frames) totalPts += Mathf.Max(0, f.width * f.height);
+        EnsureBuffers(totalPts, totalPts);
 
         // zero counters & common uniforms
         ResetCounters();
@@ -381,6 +386,16 @@ public class MultiCamPointCloudRenderer : MonoBehaviour
         int vfxCount = Mathf.Clamp(visibleFinal, 0, Mathf.Min(totalPts, vfxCapacity));
         vfx.SetInt(ID_Count, vfxCount);
 
+        CurrentValidCount   = validFinal;
+        CurrentVisibleCount = vfxCount;
+
+
+        if (!loggedFirstDraw && visibleFinal > 0)
+        {
+            loggedFirstDraw = true;
+            Debug.Log($"[PCR] First nonzero draw ✓ Visible={visibleFinal}");
+        }
+
         if (verboseFrameLogs)
         {
             Debug.Log($"[PCR] frame end | Valid={validFinal} Visible={visibleFinal} → VFX.Count={vfxCount} (cap={vfxCapacity})");
@@ -394,12 +409,6 @@ public class MultiCamPointCloudRenderer : MonoBehaviour
                     "- Does your VFX graph spawn/output when Count>0?";
                 Debug.LogWarning("[PCR] Visible==0. Hints:\n" + hints);
             }
-        }
-
-        if (!loggedFirstDraw && visibleFinal > 0)
-        {
-            loggedFirstDraw = true;
-            Debug.Log($"[PCR] First nonzero draw ✓ Visible={visibleFinal}");
         }
     }
 }

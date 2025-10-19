@@ -14,27 +14,42 @@ public struct FramePacket
 {
     public int camId;                 // 0 = A, 1 = B, etc.
     public int width, height;
-    public byte[] rgbBytes;           // JPEG/PNG bytes
-    public byte[] depthBytes;         // z16 (H*W*2, little-endian)
-    public float fx, fy, cx, cy;
-    public float cullMin, cullMax, xCull, yCull;
-    public Matrix4x4 pose;            // world_from_camera
-    public ulong timestampUs;
 
-    public bool IsValid => rgbBytes != null && depthBytes != null && width > 0 && height > 0;
+    public float fx, fy, cx, cy;      // intrinsics (scaled to current res)
+    public float cullMin, cullMax;    // meters
+    public float xCull, yCull;        // optional ROI hints
+
+    public Matrix4x4 pose;            // row-major T_world_from_camera
+    public long timestampUs;          // (not used; set 0 by sender)
+
+    public byte[] rgbBytes;           // JPEG payload
+    public byte[] depthBytes;         // z16 (mm), width*height*2
+
+    public bool IsValid =>
+        width > 0 && height > 0 &&
+        fx > 0 && fy > 0 &&
+        rgbBytes != null && rgbBytes.Length > 0 &&
+        depthBytes != null && depthBytes.Length > 0;
 }
 
 /// <summary>
-/// One-port receiver that de-multiplexes frames from multiple cameras
-/// and keeps the latest per camera in memory.
+/// One-port receiver that de-multiplexes frames from multiple cameras.
+/// Keeps the latest per-cam packet and an optional FIFO.
 /// </summary>
 public class ZmqFrameReceiver : MonoBehaviour
 {
-    [Header("Discovery & Connection")]
+    [Header("Connection")]
+    [Tooltip("If true, discover the server via UDP. Otherwise use manualServerIp.")]
     public bool autoDiscoverServer = true;
+
+    [Tooltip("Manual server IP (ignored if autoDiscoverServer is true).")]
     public string manualServerIp = "127.0.0.1";
-    public int discoveryPort = 5556;
+
+    [Tooltip("ZMQ port for frames.")]
     public int dataPort = 5555;
+
+    [Tooltip("UDP discovery port (sender listens).")]
+    public int discoveryPort = 5556;
 
     [Header("Parsing Options")]
     [Tooltip("If the sender wrote pose row-major, transpose here to match HLSL mul(_PoseMatrix, v).")]
@@ -67,9 +82,11 @@ public class ZmqFrameReceiver : MonoBehaviour
 
     public bool TryGetLatest(out FramePacket packet)
     {
-        if (_queue.TryDequeue(out packet))
+        // prefer FIFO if any, otherwise pick newest among latest
+        while (_queue.TryDequeue(out var newer)) packet = newer;
+        if (_latest.Count > 0)
         {
-            while (_queue.TryDequeue(out var newer)) packet = newer;
+            packet = _latest.Values.OrderByDescending(p => p.timestampUs).First();
             return true;
         }
         packet = default;
@@ -77,23 +94,35 @@ public class ZmqFrameReceiver : MonoBehaviour
     }
 
     // -------- Unity lifecycle --------
-    void Start()
-    {
-        isRunning = true;
-        listenerThread = new Thread(ZmqListener) { IsBackground = true };
-        listenerThread.Start();
-    }
+    void OnEnable() { StartReceiver(); }
+
+    void Start() { StartReceiver(); }
 
     void Update()
     {
         while (_logQ.TryDequeue(out var l)) Debug.Log(l);
     }
 
-    void OnDestroy()
+    void OnDisable() { StopReceiver(); }
+    void OnDestroy() { StopReceiver(); }
+
+    private void StartReceiver()
+    {
+        if (isRunning) return;
+        isRunning = true;
+        listenerThread = new Thread(ZmqListener) { IsBackground = true };
+        listenerThread.Start();
+    }
+
+    public void StopReceiver()
     {
         isRunning = false;
         try { subSocket?.Close(); subSocket?.Dispose(); } catch { }
         try { if (listenerThread != null && listenerThread.IsAlive) listenerThread.Join(200); } catch { }
+        listenerThread = null;
+        subSocket = null;
+        // Clean up NetMQ global resources between Play sessions
+        try { NetMQConfig.Cleanup(false); } catch { }
     }
 
     private void BGLog(string msg) => _logQ.Enqueue($"[ZMQ {DateTime.Now:HH:mm:ss.fff}] {msg}");
@@ -102,11 +131,9 @@ public class ZmqFrameReceiver : MonoBehaviour
     private string FindServer(int timeoutMs = 1000)
     {
         string discoveredIp = null;
-        using (var client = new UdpClient())
+        using (var client = new UdpClient { EnableBroadcast = true })
         {
-            client.EnableBroadcast = true;
             client.Client.ReceiveTimeout = timeoutMs;
-
             var broadcastEp = new IPEndPoint(IPAddress.Broadcast, discoveryPort);
             byte[] request = Encoding.ASCII.GetBytes("DISCOVER_ZMQ_SERVER");
             try
@@ -147,8 +174,9 @@ public class ZmqFrameReceiver : MonoBehaviour
         }
         if (string.IsNullOrEmpty(serverIp)) { _logQ.Enqueue("[ZMQ] ERROR: No server IP. Listener stops."); return; }
 
-        using (subSocket = new PullSocket())
+        try
         {
+            subSocket = new PullSocket();
             subSocket.Options.ReceiveHighWatermark = 3;
             subSocket.Connect($"tcp://{serverIp}:{dataPort}");
             if (logConnection) BGLog($"CONNECT → tcp://{serverIp}:{dataPort}");
@@ -168,7 +196,7 @@ public class ZmqFrameReceiver : MonoBehaviour
                         if (logFirstPacketPerCam && !_seenCam.ContainsKey(packet.camId))
                         {
                             _seenCam[packet.camId] = true;
-                            BGLog($"PACKET(cam {packet.camId}) {packet.width}x{packet.height} | rgb={packet.rgbBytes?.Length ?? 0}B depth={packet.depthBytes?.Length ?? 0}B ts={packet.timestampUs}");
+                            BGLog($"PACKET(cam {packet.camId}) {{w={packet.width} h={packet.height} rgb={packet.rgbBytes?.Length ?? 0}B depth={packet.depthBytes?.Length ?? 0}B}}");
                         }
                     }
                 }
@@ -179,48 +207,65 @@ public class ZmqFrameReceiver : MonoBehaviour
                 }
             }
         }
+        catch (Exception ex)
+        {
+            BGLog($"Listener error: {ex}");
+        }
+        finally
+        {
+            try { subSocket?.Close(); subSocket?.Dispose(); } catch { }
+        }
     }
 
-    // -------- Parser (one-port multiplexed) --------
-    //
-    // Binary layout (little-endian):
-    // [camId:1][flags:1][reserved:2]
-    // [width:4][height:4]
-    // [fx:4][fy:4][cx:4][cy:4]
-    // [zMin:4][zMax:4][xCull:4][yCull:4]
-    // [pose:16*4 floats (row-major from sender)]
-    // [timestampUs:int64]
-    // [rgbLen:int32][rgbBytes]
-    // [depthLen:int32][depthBytes]
-    //
-    private bool TryParseMultiplexPacket(byte[] buf, out FramePacket packet)
+    // -------- Packet parsing (matches Python sender layout) --------
+    // Little-endian:
+    // [width][height]
+    // [rgb_len][rgb_bytes]
+    // [depth_len][depth_bytes]
+    // [fx,fy,cx,cy]
+    // [zMin,zMax,xCull,yCull]
+    // [pose_4x4 (16 floats, row-major)]
+    // [camId (uint8)]
+    bool TryParseMultiplexPacket(byte[] buf, out FramePacket packet)
     {
         packet = default;
-        if (buf == null || buf.Length < 8) return false;
         int o = 0;
         bool Need(int n) => (o + n) <= buf.Length;
 
-        if (!Need(4)) return false;
-        int camId = buf[o]; o += 1;
-        o += 1; // flags
-        o += 2; // reserved
-
+        // width, height
         if (!Need(8)) return false;
         int w = BitConverter.ToInt32(buf, o); o += 4;
         int h = BitConverter.ToInt32(buf, o); o += 4;
 
+        // rgb blob
+        if (!Need(4)) return false;
+        int rgbLen = BitConverter.ToInt32(buf, o); o += 4;
+        if (!Need(rgbLen)) return false;
+        byte[] rgb = new byte[rgbLen];
+        Buffer.BlockCopy(buf, o, rgb, 0, rgbLen); o += rgbLen;
+
+        // depth blob (z16, mm)
+        if (!Need(4)) return false;
+        int depthLen = BitConverter.ToInt32(buf, o); o += 4;
+        if (!Need(depthLen)) return false;
+        byte[] depth = new byte[depthLen];
+        Buffer.BlockCopy(buf, o, depth, 0, depthLen); o += depthLen;
+
+        // intrinsics
         if (!Need(16)) return false;
         float fx = BitConverter.ToSingle(buf, o); o += 4;
         float fy = BitConverter.ToSingle(buf, o); o += 4;
         float cx = BitConverter.ToSingle(buf, o); o += 4;
         float cy = BitConverter.ToSingle(buf, o); o += 4;
 
+        // cull
         if (!Need(16)) return false;
         float zmin = BitConverter.ToSingle(buf, o); o += 4;
         float zmax = BitConverter.ToSingle(buf, o); o += 4;
         float xCull = BitConverter.ToSingle(buf, o); o += 4;
         float yCull = BitConverter.ToSingle(buf, o); o += 4;
 
+        // pose 4x4 (row-major T_world_from_camera)
         if (!Need(64)) return false;
         Matrix4x4 pose = new Matrix4x4();
         pose.m00 = BitConverter.ToSingle(buf, o); o += 4;  pose.m01 = BitConverter.ToSingle(buf, o); o += 4;  pose.m02 = BitConverter.ToSingle(buf, o); o += 4;  pose.m03 = BitConverter.ToSingle(buf, o); o += 4;
@@ -229,27 +274,20 @@ public class ZmqFrameReceiver : MonoBehaviour
         pose.m30 = BitConverter.ToSingle(buf, o); o += 4;  pose.m31 = BitConverter.ToSingle(buf, o); o += 4;  pose.m32 = BitConverter.ToSingle(buf, o); o += 4;  pose.m33 = BitConverter.ToSingle(buf, o); o += 4;
         if (transposeIncomingPose) pose = pose.transpose;
 
-        if (!Need(8)) return false;
-        ulong ts = BitConverter.ToUInt64(buf, o); o += 8;
-
-        if (!Need(4)) return false;
-        int rgbLen = BitConverter.ToInt32(buf, o); o += 4;
-        if (!Need(rgbLen)) return false;
-        byte[] rgb = new byte[rgbLen]; Buffer.BlockCopy(buf, o, rgb, 0, rgbLen); o += rgbLen;
-
-        if (!Need(4)) return false;
-        int depthLen = BitConverter.ToInt32(buf, o); o += 4;
-        if (!Need(depthLen)) return false;
-        byte[] depth = new byte[depthLen]; Buffer.BlockCopy(buf, o, depth, 0, depthLen); o += depthLen;
+        // camId (uint8)
+        if (!Need(1)) return false;
+        int camId = buf[o]; o += 1;
 
         packet = new FramePacket
         {
             camId = camId,
             width = w, height = h,
-            rgbBytes = rgb, depthBytes = depth,
+            rgbBytes = rgb,
+            depthBytes = depth,
             fx = fx, fy = fy, cx = cx, cy = cy,
             cullMin = zmin, cullMax = zmax, xCull = xCull, yCull = yCull,
-            pose = pose, timestampUs = ts
+            pose = pose,
+            timestampUs = 0 // not sent by current sender
         };
         return true;
     }

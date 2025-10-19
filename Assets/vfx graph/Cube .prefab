@@ -180,6 +180,7 @@ GameObject:
   serializedVersion: 6
   m_Component:
   - component: {fileID: 5546458135206562656}
+  - component: {fileID: 5590585099632210637}
   m_Layer: 0
   m_Name: Network
   m_TagString: Untagged
@@ -202,6 +203,26 @@ Transform:
   m_Children: []
   m_Father: {fileID: 3275378589342973200}
   m_LocalEulerAnglesHint: {x: 0, y: 0, z: 0}
+--- !u!114 &5590585099632210637
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 1562872327185116832}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: e7f6cf870710569478dc24a9ecd07086, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: 
+  autoDiscoverServer: 1
+  manualServerIp: 127.0.0.1
+  discoveryPort: 5556
+  dataPort: 5555
+  transposeIncomingPose: 1
+  logDiscovery: 1
+  logConnection: 1
+  logFirstPacketPerCam: 1
 --- !u!1 &1967682112735742087
 GameObject:
   m_ObjectHideFlags: 0
@@ -347,6 +368,7 @@ GameObject:
   serializedVersion: 6
   m_Component:
   - component: {fileID: 267843864621999556}
+  - component: {fileID: 1721577903451680705}
   m_Layer: 0
   m_Name: Renderer
   m_TagString: Untagged
@@ -369,6 +391,39 @@ Transform:
   m_Children: []
   m_Father: {fileID: 3275378589342973200}
   m_LocalEulerAnglesHint: {x: 0, y: 0, z: 0}
+--- !u!114 &1721577903451680705
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 2407296292502743935}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 56f8d87432c7a044c98c6f33a77bc0a5, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: 
+  receiver: {fileID: 5590585099632210637}
+  pointCloudCompute: {fileID: 7200000, guid: d470c4bc374ab8743be4e0d4f54096ff, type: 3}
+  vfx: {fileID: 5247430792085061985}
+  vfxCapacity: 750000
+  positionsName: Positions
+  colorsName: Colors
+  countName: Count
+  depthBufName: depthBuffer
+  poseName: _PoseMatrix
+  colorTexName: _ColorTex
+  useColorName: _UseColorTex
+  useColor: 1
+  doFrustumTest: 0
+  flipPosX: 0
+  flipPosY: 1
+  flipRgbX: 0
+  flipRgbY: 1
+  verboseFrameLogs: 1
+  logPerDispatch: 1
+  warnOnDepthMismatch: 1
+  enableF1TestSlab: 1
 --- !u!1 &3313007832647104602
 GameObject:
   m_ObjectHideFlags: 0
@@ -677,7 +732,10 @@ VisualEffect:
   m_ResourceVersion: 1
   m_PropertySheet:
     m_Float:
-      m_Array: []
+      m_Array:
+      - m_Value: 0.1
+        m_Name: PointSizeWorld
+        m_Overridden: 1
     m_Vector2f:
       m_Array: []
     m_Vector3f:
@@ -759,7 +817,7 @@ GameObject:
   m_Icon: {fileID: 0}
   m_NavMeshLayer: 0
   m_StaticEditorFlags: 0
-  m_IsActive: 0
+  m_IsActive: 1
 --- !u!224 &1860247459131201358
 RectTransform:
   m_ObjectHideFlags: 0
