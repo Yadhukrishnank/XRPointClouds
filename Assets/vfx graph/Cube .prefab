@@ -215,8 +215,11 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: be6d30411fa070749afa70b0d77b3df3, type: 3}
   m_Name: 
   m_EditorClassIdentifier: 
-  host: 127.0.0.1
-  ports: b3150000b4150000
+  autoDiscoverServer: 1
+  discoveryPort: 5554
+  discoveryRetries: 3
+  host: 192.168.0.139
+  ports: b3150000b4150000b5150000
   logConnections: 1
   logPackets: 0
 --- !u!1 &1967682112735742087
@@ -230,6 +233,7 @@ GameObject:
   - component: {fileID: 1381550140062945072}
   - component: {fileID: 3933143593388652071}
   - component: {fileID: 2292775858854195707}
+  - component: {fileID: 1371146865779136340}
   m_Layer: 0
   m_Name: RendererHUD
   m_TagString: Untagged
@@ -357,6 +361,20 @@ MonoBehaviour:
   m_hasFontAssetChanged: 0
   m_baseMaterial: {fileID: 0}
   m_maskOffset: {x: 0, y: 0, z: 0, w: 0}
+--- !u!114 &1371146865779136340
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 1967682112735742087}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: e01bc2800c3a4f24893bc2dcd3f38220, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: 
+  textTarget: {fileID: 2292775858854195707}
+  rendererRef: {fileID: 1878316825567496601}
 --- !u!1 &2407296292502743935
 GameObject:
   m_ObjectHideFlags: 0
@@ -412,16 +430,12 @@ MonoBehaviour:
   cullMax: 8
   xCull: 0
   yCull: 0
-  doFrustumTest: 1
+  doFrustumTest: 0
   flipPosX: 0
   flipPosY: 1
   flipRgbX: 0
   flipRgbY: 1
   usePacketPosesIfPresent: 1
-  logKernelInfo: 1
-  logIntrinsics: 1
-  logDepthStats: 0
-  statsLogEverySeconds: 1
 --- !u!1 &3313007832647104602
 GameObject:
   m_ObjectHideFlags: 0
